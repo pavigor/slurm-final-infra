@@ -1,0 +1,238 @@
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^main$/'
+      variables:
+        TF_LABEL_ENVIRONMENT: 'prod'
+    - if: '$CI_COMMIT_BRANCH =~ /^develop$/'
+      variables:
+        TF_LABEL_ENVIRONMENT: 'dev'
+
+stages:
+  - plan
+  - deploy
+  - destroy
+  - install-gitlab-deps
+  - install-components
+  - export
+  - dns
+
+.install-yc: &install-yc
+  - curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -i /usr
+  - yc config profile create yelb
+  - yc config set folder-id ${YC_FOLDER_ID}
+  - yc config set token ${YC_TOKEN}
+  - yc config set cloud-id ${YC_CLOUD_ID}
+  - export K8S_CLUSTER_NAME=$(yc managed-kubernetes cluster list --format json | jq -r .[].name)
+  - yc managed-kubernetes cluster get-credentials $K8S_CLUSTER_NAME --external --kubeconfig ./yelb-k8s-config.yml
+  - export KUBECONFIG=./yelb-k8s-config.yml
+
+image:
+  name: hashicorp/terraform
+  entrypoint:
+    - '/usr/bin/env'
+    - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+default:
+  before_script:
+    - export TF_CLI_CONFIG_FILE=".terraformrc"
+    - export YC_TOKEN=${YC_TOKEN}
+    - export YC_CLOUD_ID=${YC_CLOUD_ID}
+    - export YC_FOLDER_ID=${YC_FOLDER_ID}
+  cache:
+    key: ci-infra-$CI_COMMIT_SHORT_SHA
+    paths:
+    - "*.tfplan"
+    - ".terraform"
+    - ".terraform.lock.hcl"
+    - "output.json"
+
+Infra:validate-and-plan:
+  stage: plan
+  tags:
+    - terraform
+  script:
+    - terraform fmt -recursive -diff
+    - terraform init -backend-config="access_key=${YC_S3_ACCESS_KEY}" -backend-config="secret_key=${YC_S3_SECRET_KEY}"
+    - terraform validate
+    - terraform plan -var=folder_id=${YC_FOLDER_ID} -var-file=var.tfvars -var-file=db.tfvars -var-file=kube_cluster.tfvars -out=yelb-infra.tfplan
+
+Infra:deploy:
+  stage: deploy
+  tags:
+    - terraform
+  script:
+    - terraform apply -auto-approve yelb-infra.tfplan
+    - terraform output -json > output.json
+  when: manual
+
+Infra:destroy:
+  stage: destroy
+  tags:
+    - terraform
+  script:
+    - terraform destroy -auto-approve -var=folder_id=${YC_FOLDER_ID} -var-file=var.tfvars -var-file=db.tfvars -var-file=kube_cluster.tfvars
+  when: manual
+
+Kubernetes:create-gitlab-service-account:
+  stage: install-gitlab-deps
+  when: manual
+  before_script:
+    - ''
+  image: centosadmin/kubernetes-helm:3.6.3
+  tags:
+    - terraform
+  script:
+    - apk add --no-cache bash curl jq
+    - *install-yc
+    - kubectl apply -f kubernetes/gitlab-admin-service-account.yml
+    - export KUBE_TOKEN=`kubectl -n kube-system get secrets -o json | jq -r '.items[] | select(.metadata.name | startswith("gitlab-admin")) | .data.token' | base64 --decode`
+    - 'curl --request PUT --header "PRIVATE-TOKEN: ${APP_REPO_ACCESS_TOKEN}"  "https://s018753.gitlab.yandexcloud.net/api/v4/projects/3/variables/KUBE_TOKEN" --form "value=$KUBE_TOKEN"'
+
+Kubernetes:gitlab-runner:
+  stage: install-gitlab-deps
+  when: manual
+  before_script:
+    - ''
+  image: centosadmin/kubernetes-helm:3.6.3
+  tags:
+    - terraform
+  script:
+    - *install-yc
+    - sed -i 's/GITLAB_ADDRESS/${CI_SERVER_URL}/g' kubernetes/gitlab-runner/values.yaml
+    - sed -i 's/GITLAB_REGISTRATION_TOKEN/${CI_SERVER_URL}/g' kubernetes/gitlab-runner/values.yaml
+    - helm repo add gitlab https://charts.gitlab.io
+    - helm repo update
+    - 'helm upgrade --install --namespace gitlab-runner --create-namespace --atomic gitlab-runner -f kubernetes/gitlab-runner/values.yaml gitlab/gitlab-runner'
+
+Kubernetes:ingress:
+  stage: install-components
+  when: manual
+  before_script:
+    - ''
+  image: centosadmin/kubernetes-helm:3.6.3
+  tags:
+    - terraform
+  script:
+    - *install-yc
+    - helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+    - helm repo update
+    - 'helm upgrade --install --namespace ingress-nginx --create-namespace --atomic ingress-nginx ingress-nginx/ingress-nginx '
+    - kubectl apply -f https://github.com/jetstack/cert-manager/releases/download/v1.9.1/cert-manager.yaml
+    - echo "Get external address"
+    - export INGRESS_ADDRESS=`kubectl get services --namespace ingress-nginx ingress-nginx-controller --output jsonpath='{.status.loadBalancer.ingress[0].ip}'`
+    - echo "Update external address in Gitlab project with $INGRESS_ADDRESS"
+    - 'curl --request PUT --header "PRIVATE-TOKEN: ${CI_TOKEN}"  "https://s018753.gitlab.yandexcloud.net/api/v4/projects/2/variables/INGRESS_ADDRESS" --form "value=$INGRESS_ADDRESS"'
+
+Kubernetes:redis:
+  stage: install-components
+  when: manual
+  before_script:
+    - ''
+  image: centosadmin/kubernetes-helm:3.6.3
+  tags:
+    - terraform
+  script:
+    - *install-yc
+    - kubectl create namespace yelb-cache || true
+    - helm repo add bitnami https://charts.bitnami.com/bitnami
+    - helm upgrade --install yelb-cache -f redis/values.yaml bitnami/redis
+      --wait
+      --timeout 300s
+      --atomic
+      --debug
+      --namespace yelb-cache
+
+Monitoring:fluentbit:
+  stage: install-components
+  when: manual
+  before_script:
+    - ''
+  image: alpine:3.16
+  tags:
+    - terraform
+  script:
+    - apk add --no-cache bash curl jq
+    - export VERIFY_CHECKSUM=false
+    - if [ ! -f "output.json" ]; then echo "Terraform output variables files doesn't exist!" && exit 1; fi
+    - curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+    - helm version
+    - *install-yc
+    - | 
+     yc iam key create --service-account-name sa-fluent-bit --output key.json
+     export HELM_EXPERIMENTAL_OCI=1
+     export LOGGING_GROUP_ID=`cat output.json | jq .logging_group_id.value | tr -d '"'`
+     export CLUSTER_ID=`cat output.json | jq .kubernetes_cluster_id.value | tr -d '"'`
+     cat key.json | helm registry login cr.yandex --username 'json_key' --password-stdin && \
+     helm pull oci://cr.yandex/yc-marketplace/yandex-cloud/fluent-bit/fluent-bit-cloud-logging \
+       --version 1.0-7 \
+       --untar &&\
+     helm install \
+       --namespace logging \
+       --create-namespace \
+       --set loggingGroupId=$LOGGING_GROUP_ID \
+       --set loggingFilter=$CLUSTER_ID \
+       --set-file auth.json=key.json \
+       fluentbit ./fluent-bit-cloud-logging/
+
+Monitoring:prom-grafana:
+  stage: install-components
+  when: manual
+  before_script:
+    - ''
+  image: alpine:3.16
+  tags:
+    - terraform
+  script:
+    - apk add --no-cache bash curl jq
+    - *install-yc
+    - export VERIFY_CHECKSUM=false
+    - |
+      kubectl create namespace monitoring || true
+      curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      helm version
+      helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+      helm repo add tricksterproxy https://helm.tricksterproxy.io
+      helm repo update
+      helm install --namespace monitoring prometheus prometheus-community/prometheus
+      helm install --namespace monitoring trickster tricksterproxy/trickster -f monitoring/grafana-prometheus/trickster.yaml
+      kubectl apply -f monitoring/grafana-prometheus/grafana.yaml
+
+Variables:export:
+  stage: export
+  when: manual
+  tags:
+    - terraform
+  before_script:
+    - ''
+  image: alpine:3.16
+  script: |
+    apk add --no-cache bash curl jq
+    if [ ! -f "output.json" ]; then echo "Terraform output variables files doesn't exist!" && exit 1; fi
+    export DB_HOST=`cat output.json | jq .db_host.value | tr -d '"'` && \
+      curl --request PUT --header "PRIVATE-TOKEN: ${APP_REPO_ACCESS_TOKEN}"  "https://s018753.gitlab.yandexcloud.net/api/v4/projects/3/variables/DB_HOST" --form "value=$DB_HOST"
+    export DB_NAME=`cat output.json | jq .db_name.value | tr -d '"'` && \
+      curl --request PUT --header "PRIVATE-TOKEN: ${APP_REPO_ACCESS_TOKEN}"  "https://s018753.gitlab.yandexcloud.net/api/v4/projects/3/variables/DB_NAME" --form "value=$DB_NAME"
+    export DB_PASSWORD=`cat output.json | jq .db_password.value | tr -d '"'` && \
+      curl --request PUT --header "PRIVATE-TOKEN: ${APP_REPO_ACCESS_TOKEN}"  "https://s018753.gitlab.yandexcloud.net/api/v4/projects/3/variables/DB_PASSWORD" --form "value=$DB_PASSWORD"
+    export DB_USERNAME=`cat output.json | jq .db_username.value | tr -d '"'` && \
+      curl --request PUT --header "PRIVATE-TOKEN: ${APP_REPO_ACCESS_TOKEN}"  "https://s018753.gitlab.yandexcloud.net/api/v4/projects/3/variables/DB_USERNAME" --form "value=$DB_USERNAME"
+    export YC_REGISTRY_ID=`cat output.json | jq .registry_id.value | tr -d '"'` && \
+      curl --request PUT --header "PRIVATE-TOKEN: ${APP_REPO_ACCESS_TOKEN}"  "https://s018753.gitlab.yandexcloud.net/api/v4/projects/3/variables/YC_REGISTRY_ID" --form "value=$YC_REGISTRY_ID"
+    export KUBE_URL=`cat output.json | jq .kubernetes_external_endpoint.value | tr -d '"'` && \
+      curl --request PUT --header "PRIVATE-TOKEN: ${APP_REPO_ACCESS_TOKEN}"  "https://s018753.gitlab.yandexcloud.net/api/v4/projects/3/variables/KUBE_URL" --form "value=$KUBE_URL"
+
+DNS:add-dns-records:
+  stage: dns
+  when: manual
+  tags:
+    - terraform
+  before_script:
+    - ''
+  image: alpine:3.16
+  script: |
+    apk add --no-cache bash curl jq
+    if [[ "${INGRESS_ADDRESS}" == "0.0.0.0" ]]; then echo "External address doesn't exists" && exit 1; fi
+    export DNS_TYPE=`cat output.json | jq .dns_challenge.value | tr -d '"' | cut -f1 -d:`
+    export DNS_RECORD=`cat output.json | jq .dns_challenge.value | tr -d '"' | cut -f2 -d:`
+    curl -X GET -d "input_data={\"username\":\"${REG_RU_API_USERNAME}\",\"password\":\"${REG_RU_API_PASSWORD}\",\"domains\":[{\"dname\":\"dev-ooops.com\"}],\"subdomain\":\"yelb\",\"ipaddr\":\"${INGRESS_ADDRESS}\",\"output_content_type\":\"plain\"}&input_format=json" 'https://api.reg.ru/api/regru2/zone/add_alias'
+    curl -X GET -d "input_data={\"username\":\"${REG_RU_API_USERNAME}\",\"password\":\"${REG_RU_API_PASSWORD}\",\"domains\":[{\"dname\":\"dev-ooops.com\"}],\"subdomain\":\"_acme-challenge.yelb\",\"canonical_name\":\"$DNS_RECORD\",\"output_content_type\":\"plain\"}&input_format=json" 'https://api.reg.ru/api/regru2/zone/add_cname'
